@@ -1,0 +1,208 @@
+package main
+
+import (
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+)
+
+// fakeProvider 每次返回一个新代理，用序号区分。
+type fakeProvider struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (p *fakeProvider) Next() (string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.n++
+	return fmt.Sprintf("socks5://10.0.0.%d:1080", p.n), nil
+}
+
+func newTestRotator(source, mode string, interval time.Duration) *Rotator {
+	cfg := &Config{
+		Source:         source,
+		Mode:           mode,
+		ParsedInterval: interval,
+		TestURL:        "http://test.invalid",
+	}
+	r := NewRotator(cfg, &fakeProvider{}, NewStats(0.01))
+	// 防抖冷却在测试里必须关掉：它会让刚轮换后的 MarkFailed 直接被吞掉。
+	r.cooldown = 0
+	r.probe = func(string, string) bool { return false }
+	return r
+}
+
+func mustGet(t *testing.T, r *Rotator) string {
+	t.Helper()
+	p, err := r.Get()
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	return p
+}
+
+// cycle 模式只在到点时换：没到点的请求必须复用当前代理，否则就是在烧钱。
+func TestRotatorCycle(t *testing.T) {
+	r := newTestRotator("file", "cycle", time.Minute)
+
+	p1 := mustGet(t, r)
+	if got := mustGet(t, r); got != p1 {
+		t.Fatalf("未到点就轮换了：%s -> %s", p1, got)
+	}
+
+	r.lastSwitch = time.Now().Add(-time.Minute)
+	if got := mustGet(t, r); got == p1 {
+		t.Fatalf("到点了却没轮换，仍是 %s", got)
+	}
+}
+
+func TestRotatorLoadbalance(t *testing.T) {
+	r := newTestRotator("file", "loadbalance", 0)
+
+	seen := map[string]bool{}
+	for range 3 {
+		seen[mustGet(t, r)] = true
+	}
+	if len(seen) != 3 {
+		t.Fatalf("loadbalance 应当每请求一换，实际只用了 %d 个代理", len(seen))
+	}
+}
+
+// file 来源轮换免费：连续失败计数到阈值即换，不探测。
+func TestMarkFailedFileCountsToThreshold(t *testing.T) {
+	r := newTestRotator("file", "cycle", time.Minute)
+	r.probe = func(string, string) bool {
+		t.Fatal("file 来源不该探测：探测省不下钱，纯属多一次往返")
+		return false
+	}
+
+	p1 := mustGet(t, r)
+	for range defaultFailThreshold - 1 {
+		r.MarkFailed()
+	}
+	if got := mustGet(t, r); got != p1 {
+		t.Fatalf("没到阈值就换了：%s -> %s", p1, got)
+	}
+
+	r.MarkFailed()
+	if got := mustGet(t, r); got == p1 {
+		t.Fatalf("到阈值了却没换，仍是 %s", got)
+	}
+}
+
+// OnSuccess 清零计数：零星失败混着成功不该攒够阈值。
+func TestOnSuccessResetsFailures(t *testing.T) {
+	r := newTestRotator("file", "cycle", time.Minute)
+
+	p1 := mustGet(t, r)
+	for range defaultFailThreshold * 2 {
+		r.MarkFailed()
+		r.OnSuccess()
+	}
+	if got := mustGet(t, r); got != p1 {
+		t.Fatalf("成功已清零计数，不该轮换：%s -> %s", p1, got)
+	}
+}
+
+// api 来源探通 → 是目标/网络抖动，保留当前代理，省下一个付费 IP。
+func TestMarkFailedAPIKeepsProxyWhenProbeAlive(t *testing.T) {
+	r := newTestRotator("api", "cycle", time.Minute)
+	r.probe = func(string, string) bool { return true }
+
+	p1 := mustGet(t, r)
+	r.MarkFailed()
+	if got := mustGet(t, r); got != p1 {
+		t.Fatalf("代理还活着却换掉了，白烧一个付费 IP：%s -> %s", p1, got)
+	}
+}
+
+// api 来源探不通 → 代理真死了，下一个请求换。
+func TestMarkFailedAPISwitchesWhenProbeDead(t *testing.T) {
+	r := newTestRotator("api", "cycle", time.Minute)
+
+	p1 := mustGet(t, r)
+	r.MarkFailed()
+	if got := mustGet(t, r); got == p1 {
+		t.Fatalf("代理已死却没换，仍是 %s", got)
+	}
+}
+
+// 探测在锁外做，期间 current 可能已被换掉。旧结论不能牵连新代理，
+// 否则会因为"P1 死了"切掉从没测过的 P2——白烧一个本来要省下的付费 IP。
+func TestMarkFailedRecheckAfterProbe(t *testing.T) {
+	r := newTestRotator("api", "cycle", time.Minute)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	r.probe = func(string, string) bool {
+		close(entered)
+		<-release
+		return false // 被探的那个（P1）确实死了
+	}
+
+	p1 := mustGet(t, r)
+
+	done := make(chan struct{})
+	go func() {
+		r.MarkFailed()
+		close(done)
+	}()
+
+	<-entered // MarkFailed 已放锁、正卡在探测里
+	p2, err := r.Switch()
+	if err != nil {
+		t.Fatalf("Switch: %v", err)
+	}
+	if p2 == p1 {
+		t.Fatalf("Switch 没换代理")
+	}
+	close(release)
+	<-done
+
+	if got := mustGet(t, r); got != p2 {
+		t.Fatalf("P1 的死讯牵连了没测过的 P2：want %s, got %s", p2, got)
+	}
+}
+
+// 探测期间 Get() 不能被阻塞：故障恢复期恰恰是最该保持可用的时候。
+func TestGetNotBlockedDuringProbe(t *testing.T) {
+	r := newTestRotator("api", "cycle", time.Minute)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	r.probe = func(string, string) bool {
+		close(entered)
+		<-release
+		return false
+	}
+
+	p1 := mustGet(t, r)
+	go r.MarkFailed()
+	<-entered
+
+	got := make(chan string, 1)
+	go func() { got <- mustGet(t, r) }()
+
+	select {
+	case p := <-got:
+		if p != p1 {
+			t.Fatalf("探测期间应继续返回当前代理，got %s", p)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Get() 被探测阻塞了")
+	}
+	close(release)
+}
+
+// probeCacheTTL > probeTimeout 是硬约束：反过来的话缓存刚写入就过期，
+// 失败场景下等于没有缓存。上限也有约束，分钟级缓存会拒绝该做的切换。
+func TestProbeCacheTTLInvariant(t *testing.T) {
+	if probeCacheTTL <= probeTimeout {
+		t.Fatalf("probeCacheTTL(%v) 必须大于 probeTimeout(%v)", probeCacheTTL, probeTimeout)
+	}
+	if probeCacheTTL >= time.Minute {
+		t.Fatalf("probeCacheTTL(%v) 不能到分钟级：代理刚死时会命中旧的\"有效\"缓存", probeCacheTTL)
+	}
+}

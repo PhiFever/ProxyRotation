@@ -1,0 +1,44 @@
+# 复制为 config.yaml 后修改。config.yaml 含凭据，已被 .gitignore 排除。
+listen: ":1080"            # 入站 HTTP 代理监听地址
+admin_listen: "127.0.0.1:8080"   # 管理接口监听地址。无鉴权，默认只开回环；
+                           #   要从别处访问请走 SSH 隧道，不要直接改成 ":8080"
+
+mode: "cycle"              # cycle（按时间轮换）| loadbalance（按请求轮换）
+interval: "300s"           # cycle 模式的轮换间隔（Go duration 字符串）
+
+source: "file"             # file | api | command
+proxy_file: "proxies.txt"  # source=file：代理列表文件，每行一个完整 URL
+                           #   （socks5://... 或 http://user:pass@ip:port）。
+                           #   启动时会整表并发探测一遍，死代理不进轮换；全挂则拒绝启动。
+
+api_url: ""                # source=api：取 IP 接口地址。
+                           #   接口自身的鉴权（token / appKey / 签名）直接写进查询参数：
+                           #   http://api.xxx.com/get?token=SECRET&num=1&type=socks5
+command: ""                # source=command：每次要新代理时执行的命令，读其 stdout 第一行。
+                           #   时间签名、白名单登记等"每次都变、塞不进静态 URL"的逻辑写进脚本。
+
+# ↓↓↓ 以下 3 项被 api / command 共用：接口只返回裸 ip:port 时怎么拨号 ↓↓↓
+proxy_scheme: "socks5"     # 返回裸 ip:port 时按此协议拨号：socks5 | http
+proxy_user: ""             # 代理商另发的代理账号（可选），最终拼成
+proxy_pass: ""             #   scheme://user:pass@ip:port
+
+# 链式代理（可选）：所有上游连接先穿过这一跳，再从那里连上游代理。
+#   典型用途是本机到短效代理之间根本不通（被墙、或代理商只允许特定出口访问），
+#   拿一个能到达它们的节点当前置。留空则直连上游。
+# ★前置的可用性优先于一切：它一挂，每个上游都会"看起来"是死的——file 来源会整表
+#   探不通而拒绝启动，api / command 来源则每次失败都判定该换 IP，以最快速度烧钱。
+#   所以启动时会先单独探一次前置，探不通就直接退出。
+via: ""                    # socks5://1.2.3.4:1080 或 http://user:pass@1.2.3.4:8080
+
+unit_price: 0.03           # 每个 IP 的单价（元），用于成本估算
+
+# 失效探测目标：上游失败时，通过当前代理请求此地址，通则认为代理还活着、不切换。
+# ★强烈建议填你代理商提供的测试端点
+#   从他们自己的出口访问必然通畅，不受第三方站点抖动干扰。
+# ★务必确认该地址在代理出口所在地可达：国内出口填 gstatic 之类的地址会导致
+#   健康代理也被判死，失败自愈退化成"每次失败都换 IP"，静默烧钱。
+test_url: "http://connectivitycheck.platform.hicloud.com/generate_204"
+
+auth:                      # 入站代理鉴权（可选，留空则不鉴权）
+  username: ""
+  password: ""
