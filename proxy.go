@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -65,12 +66,14 @@ func (s *ProxyServer) checkInboundAuth(r *http.Request) bool {
 func (s *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	upstream, err := s.rotator.Get()
 	if err != nil {
+		logUpstreamFail(r, upstream, err)
 		http.Error(w, "no upstream proxy available", http.StatusBadGateway)
 		return
 	}
 
 	upstreamConn, err := dialUpstream(s.cfg.Via, upstream, r.Host)
 	if err != nil {
+		logUpstreamFail(r, upstream, err)
 		s.rotator.MarkFailed()
 		http.Error(w, "upstream dial failed", http.StatusBadGateway)
 		return
@@ -121,12 +124,14 @@ func (s *ProxyServer) pipe(client, upstream net.Conn) {
 func (s *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	upstream, err := s.rotator.Get()
 	if err != nil {
+		logUpstreamFail(r, upstream, err)
 		http.Error(w, "no upstream proxy available", http.StatusBadGateway)
 		return
 	}
 
 	transport, err := newTransport(s.cfg.Via, upstream)
 	if err != nil {
+		logUpstreamFail(r, upstream, err)
 		http.Error(w, "upstream transport failed", http.StatusBadGateway)
 		return
 	}
@@ -139,6 +144,7 @@ func (s *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := transport.RoundTrip(outreq)
 	if err != nil {
+		logUpstreamFail(r, upstream, err)
 		s.rotator.MarkFailed()
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return
@@ -160,4 +166,21 @@ func (s *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Printf("copy response body: %v", err)
 	}
+}
+
+// logUpstreamFail 记一行转发失败的原因。客户端那边只看得到 502，上游网关给的
+// "460 Proxy Authentication Invalid" 这类关键信号不落到日志里就彻底没了，排障只能靠
+// 手工 curl 逐条复现。
+//
+// 上游只记 host:port：代理 URL 带密码，而日志会落盘（/stats 回显完整 URL 是另一回事，
+// 那是内存里的即时快照）。upstream 为空说明连当前代理都没取到。
+//
+// 数据面每连接一个 goroutine，死代理场景下每个请求都会走到这里，日志量与请求量同阶。
+// 这是有意的取舍——真出事时正需要每条都在，为它加限流器是过度设计。
+func logUpstreamFail(r *http.Request, upstream string, err error) {
+	via := "-"
+	if u, perr := url.Parse(upstream); perr == nil && u.Host != "" {
+		via = u.Host
+	}
+	log.Printf("%s %s via %s: %v", r.Method, r.Host, via, err)
 }

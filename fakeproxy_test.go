@@ -73,6 +73,34 @@ func fakeConnect(w http.ResponseWriter, r *http.Request) {
 	go func() { io.Copy(client, target); client.Close() }()
 }
 
+// startBlackhole 起一个只接受连接、之后既不读也不回的 TCP 服务端，返回 host:port。
+// 这是短效 IP 最典型死法的本机等价物：TCP 连得上、请求发得出去，然后永远没有下文。
+// 死代理只有这样才测得出来——连接一旦被关掉，客户端立刻收到 EOF，也就不会挂起了。
+func startBlackhole(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go func() {
+		var held []net.Conn // 攥住不放，直到 ln.Close() 让 Accept 出错
+		defer func() {
+			for _, c := range held {
+				c.Close()
+			}
+		}()
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			held = append(held, c)
+		}
+	}()
+	t.Cleanup(func() { ln.Close() })
+	return ln.Addr().String()
+}
+
 // countingRelay 在 addr 前面架一层只计数的 TCP 中转，用来断言某一跳确实被走到了。
 // 链式代理的测试少了它就没有意义：前置漏传时连接会直奔上游，照样成功。
 func countingRelay(t *testing.T, addr string) (string, *atomic.Int64) {

@@ -87,7 +87,12 @@ func joinLines(ss []string) string {
 
 func (e *e2eEnv) mustGet(t *testing.T, rawURL string) string {
 	t.Helper()
-	resp, err := e.client.Get(rawURL)
+	return mustGetThrough(t, e.client, rawURL)
+}
+
+func mustGetThrough(t *testing.T, c *http.Client, rawURL string) string {
+	t.Helper()
+	resp, err := c.Get(rawURL)
 	if err != nil {
 		t.Fatalf("get %s: %v", rawURL, err)
 	}
@@ -214,6 +219,62 @@ type deadProvider struct{}
 
 // 127.0.0.1:1 保证连不通，且不依赖外网
 func (deadProvider) Next() (string, error) { return "http://127.0.0.1:1", nil }
+
+// listProvider 按顺序吐出预设的代理，用完停在最后一个。
+type listProvider struct {
+	proxies []string
+	n       int
+}
+
+func (p *listProvider) Next() (string, error) {
+	proxy := p.proxies[p.n]
+	if p.n < len(p.proxies)-1 {
+		p.n++
+	}
+	return proxy, nil
+}
+
+// 上游接了 TCP 却永不回话时，明文路径必须在响应超时内回 502 并叫醒失败自愈。
+// 没有 ResponseHeaderTimeout 时这里会一直挂到客户端自己放弃（实测 25s+），
+// 期间既不返回 502 也不触发 MarkFailed——省钱机制在最该起作用的时候失效。
+func TestE2EResponseHeaderTimeoutTriggersFailover(t *testing.T) {
+	orig := responseHeaderTimeout
+	responseHeaderTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { responseHeaderTimeout = orig })
+
+	target := newTarget(t)
+	good := "http://" + testUser + ":" + testPass + "@" + startHTTPProxy(t, testUser, testPass)
+	provider := &listProvider{proxies: []string{"http://" + startBlackhole(t), good}}
+
+	cfg := &Config{Mode: "cycle", ParsedInterval: time.Minute, Source: "file", TestURL: target.URL}
+	stats := NewStats(0)
+	rotator := NewRotator(cfg, provider, stats)
+	rotator.cooldown = 0      // 防抖会吞掉刚轮换后的 MarkFailed
+	rotator.failThreshold = 1 // 一次失败就换，免得为凑阈值多等两个超时
+
+	front := httptest.NewServer(NewProxyServer(cfg, rotator, stats))
+	defer front.Close()
+	frontURL, _ := url.Parse(front.URL)
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(frontURL)}}
+
+	start := time.Now()
+	resp, err := client.Get(target.URL)
+	if err != nil {
+		t.Fatalf("请求应当拿到 502 而不是传输层错误: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("状态 = %s, want 502", resp.Status)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("挂了 %v 才回 502：响应超时没生效", elapsed)
+	}
+
+	// MarkFailed 真的被叫醒了：下一个请求应该已经换到活着的上游。
+	if got := mustGetThrough(t, client, target.URL); got != "hello from target" {
+		t.Fatalf("超时后没有切换上游: %q", got)
+	}
+}
 
 func TestE2EInboundAuth(t *testing.T) {
 	up := "http://" + testUser + ":" + testPass + "@" + startHTTPProxy(t, testUser, testPass)

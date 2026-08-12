@@ -17,6 +17,20 @@ import (
 // 不是快速 RST，没有这个上限请求 goroutine 会一直悬着。配了 via 时这个上限覆盖整条链。
 const dialTimeout = 10 * time.Second
 
+// responseHeaderTimeout 是"请求已发出 → 上游回响应头"的上限，只覆盖明文转发路径
+// （CONNECT 路径的握手在 connectHandshake 里自带 deadline）。短效 IP 最典型的死法是
+// 接了 TCP、握手也过、请求发得出去，然后永不回话：没有这个上限，明文请求会一直挂到
+// 客户端自己放弃（实测 25s+），期间既不返回 502 也不触发 MarkFailed——失败自愈叫不醒。
+//
+// 取值两头都有约束：必须 > probeTimeout（probeProxy 也走 newTransport，小于它会把
+// 探测的超时口径悄悄改掉）；也要容得下"上游正常但慢"，把健康代理误判成死的正是
+// 省钱机制失效的方式。
+//
+// 它只管到响应头——响应体传到一半卡住仍然没有上限，v1 有意不做。
+//
+// 是 var 而非 const，只为让测试能把它调小。
+var responseHeaderTimeout = 10 * time.Second
+
 // dialUpstream 通过上游代理，返回一条已经打通到 targetHostPort 的连接。
 // 返回的 conn 就是隧道本身，调用方直接双向 io.Copy 即可。
 // via 非空时先穿过它再连上游（链式代理）；为空时行为与不带前置完全一致。
@@ -45,7 +59,10 @@ func newTransport(via, proxyURL string) (*http.Transport, error) {
 	// v1 每个请求新建一个 Transport，所以必须关掉长连接：否则每请求都会在连接池里
 	// 留下一条永不复用、也永不回收的空闲连接。按上游 URL 缓存 Transport 是 M2 的事，
 	// 到那时这一行要跟着摘掉。
-	t := &http.Transport{DisableKeepAlives: true}
+	t := &http.Transport{
+		DisableKeepAlives:     true,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+	}
 
 	switch last.Scheme {
 	case "socks5":

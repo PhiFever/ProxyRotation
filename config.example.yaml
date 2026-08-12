@@ -16,6 +16,7 @@ api_url: ""                # source=api：取 IP 接口地址。
                            #   http://api.xxx.com/get?token=SECRET&num=1&type=socks5
 command: ""                # source=command：每次要新代理时执行的命令，读其 stdout 第一行。
                            #   时间签名、白名单登记等"每次都变、塞不进静态 URL"的逻辑写进脚本。
+                           #   代理商专属逻辑一律留在脚本里，见 examples/kuaidaili.sh。
 
 # ↓↓↓ 以下 3 项被 api / command 共用：接口只返回裸 ip:port 时怎么拨号 ↓↓↓
 proxy_scheme: "socks5"     # 返回裸 ip:port 时按此协议拨号：socks5 | http

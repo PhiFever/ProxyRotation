@@ -195,6 +195,14 @@ func TestProbeProxy(t *testing.T) {
 	}
 }
 
+// probeProxy 也走 newTransport：响应超时若小于探测超时，就把探测的超时口径悄悄改掉了，
+// 连带影响 probeCacheTTL > probeTimeout 那条硬约束。
+func TestResponseHeaderTimeoutInvariant(t *testing.T) {
+	if responseHeaderTimeout <= probeTimeout {
+		t.Fatalf("responseHeaderTimeout(%v) 必须大于 probeTimeout(%v)", responseHeaderTimeout, probeTimeout)
+	}
+}
+
 func hostPort(t *testing.T, rawURL string) string {
 	t.Helper()
 	u, err := url.Parse(rawURL)
