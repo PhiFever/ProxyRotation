@@ -151,7 +151,7 @@ func TestMarkFailedRecheckAfterProbe(t *testing.T) {
 	}()
 
 	<-entered // MarkFailed 已放锁、正卡在探测里
-	p2, err := r.Switch()
+	p2, _, err := r.Switch()
 	if err != nil {
 		t.Fatalf("Switch: %v", err)
 	}
@@ -256,6 +256,69 @@ func TestDeadIPsCountsFailedProviderToo(t *testing.T) {
 type brokenProvider struct{}
 
 func (brokenProvider) Next() (string, error) { return "", fmt.Errorf("取不到 IP") }
+
+// /switch 的用法是"目标站点把这个 IP 标记了，换一个"，并发采集里 N 个 worker 会同时
+// 撞上同一个被标记的 IP 各打一次。窗口内只该买一个 IP，其余调用拿到同一个新代理。
+func TestSwitchIsIdempotentWithinCooldown(t *testing.T) {
+	r := newTestRotator("command", "cycle", time.Minute)
+	r.cooldown = time.Minute // newTestRotator 默认关掉了冷却，这里正是要测它
+
+	p1 := mustGet(t, r)
+
+	p2, switched, err := r.Switch()
+	if err != nil {
+		t.Fatalf("Switch: %v", err)
+	}
+	if !switched || p2 == p1 {
+		t.Fatalf("第一次 switch 没换成：switched=%v, %s -> %s", switched, p1, p2)
+	}
+
+	for range 5 {
+		got, switched, err := r.Switch()
+		if err != nil {
+			t.Fatalf("Switch: %v", err)
+		}
+		if switched {
+			t.Fatal("窗口内又买了一个 IP")
+		}
+		if got != p2 {
+			t.Fatalf("窗口内返回的不是刚换好的那个：want %s, got %s", p2, got)
+		}
+	}
+
+	r.lastForced = time.Now().Add(-2 * time.Minute) // 窗口过去
+	if p3, switched, _ := r.Switch(); !switched || p3 == p2 {
+		t.Fatalf("窗口过后仍然换不动：switched=%v, %s -> %s", switched, p2, p3)
+	}
+}
+
+// 没有窗口的话，并发 switch 之间没有成功转发穿插，proven 一直是 false，
+// deadIPs 会一路累加到停机——防烧钱的闸门被正常用法踩响。
+func TestConcurrentSwitchDoesNotTripDeadIPs(t *testing.T) {
+	r := newTestRotator("command", "cycle", time.Minute)
+	r.cooldown = time.Minute
+	r.maxDeadIPs = 3
+	r.onExhausted = func(deadIPs int) { t.Errorf("并发 switch 把消费闸踩响了，deadIPs=%d", deadIPs) }
+
+	mustGet(t, r)
+	r.OnSuccess()
+
+	var wg sync.WaitGroup
+	for range r.maxDeadIPs * 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, _, err := r.Switch(); err != nil {
+				t.Errorf("Switch: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if n := r.stats.Snapshot().UniqueIPs; n != 2 {
+		t.Fatalf("一轮并发 switch 买了 %d 个 IP，want 2（初始 1 个 + 换 1 次）", n)
+	}
+}
 
 // probeCacheTTL > probeTimeout 是硬约束：反过来的话缓存刚写入就过期，
 // 失败场景下等于没有缓存。上限也有约束，分钟级缓存会拒绝该做的切换。

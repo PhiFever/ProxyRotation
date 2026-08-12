@@ -12,3 +12,5 @@ config.*.yaml
 /proxyrotation
 /proxyrotation.exe
 *.test
+
+*.log

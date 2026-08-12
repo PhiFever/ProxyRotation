@@ -66,14 +66,14 @@ func (s *ProxyServer) checkInboundAuth(r *http.Request) bool {
 func (s *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	upstream, err := s.rotator.Get()
 	if err != nil {
-		logUpstreamFail(r, upstream, err)
+		logUpstreamFail(r.Method, r.Host, upstream, err)
 		http.Error(w, "no upstream proxy available", http.StatusBadGateway)
 		return
 	}
 
 	upstreamConn, err := dialUpstream(s.cfg.Via, upstream, r.Host)
 	if err != nil {
-		logUpstreamFail(r, upstream, err)
+		logUpstreamFail(r.Method, r.Host, upstream, err)
 		s.rotator.MarkFailed()
 		http.Error(w, "upstream dial failed", http.StatusBadGateway)
 		return
@@ -85,7 +85,10 @@ func (s *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
 		return
 	}
-	clientConn, _, err := hijacker.Hijack()
+	// brw 不能丢：net/http 读请求头用的是它自己的 bufio，客户端若把 CONNECT 与紧随其后
+	// 的 TLS ClientHello 塞进同一个 TCP 段，那几个字节已经被读进缓冲区，交出裸 conn 就
+	// 等于把它们永久丢掉——隧道建好却握不上手。出站侧的对称检查在 connectHandshake。
+	clientConn, brw, err := hijacker.Hijack()
 	if err != nil {
 		upstreamConn.Close()
 		http.Error(w, "hijack failed", http.StatusInternalServerError)
@@ -100,7 +103,7 @@ func (s *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	s.rotator.OnSuccess()
 	s.stats.OnRequest()
-	s.pipe(clientConn, upstreamConn)
+	s.pipe(&bufferedConn{Conn: clientConn, r: brw.Reader}, upstreamConn)
 }
 
 // pipe 双向转发，任一方向结束即关闭双方收尾。
@@ -124,14 +127,14 @@ func (s *ProxyServer) pipe(client, upstream net.Conn) {
 func (s *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	upstream, err := s.rotator.Get()
 	if err != nil {
-		logUpstreamFail(r, upstream, err)
+		logUpstreamFail(r.Method, r.Host, upstream, err)
 		http.Error(w, "no upstream proxy available", http.StatusBadGateway)
 		return
 	}
 
 	transport, err := newTransport(s.cfg.Via, upstream)
 	if err != nil {
-		logUpstreamFail(r, upstream, err)
+		logUpstreamFail(r.Method, r.Host, upstream, err)
 		http.Error(w, "upstream transport failed", http.StatusBadGateway)
 		return
 	}
@@ -144,7 +147,7 @@ func (s *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := transport.RoundTrip(outreq)
 	if err != nil {
-		logUpstreamFail(r, upstream, err)
+		logUpstreamFail(r.Method, r.Host, upstream, err)
 		s.rotator.MarkFailed()
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return
@@ -175,12 +178,15 @@ func (s *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 // 上游只记 host:port：代理 URL 带密码，而日志会落盘（/stats 回显完整 URL 是另一回事，
 // 那是内存里的即时快照）。upstream 为空说明连当前代理都没取到。
 //
+// method / target 分开传而不是收一个 *http.Request：SOCKS5 入站路径压根没有 Request，
+// 它传的是 "SOCKS5" 和握手里读到的目标。格式一致才好 grep，绝不为它另写一个 log 函数。
+//
 // 数据面每连接一个 goroutine，死代理场景下每个请求都会走到这里，日志量与请求量同阶。
 // 这是有意的取舍——真出事时正需要每条都在，为它加限流器是过度设计。
-func logUpstreamFail(r *http.Request, upstream string, err error) {
+func logUpstreamFail(method, target, upstream string, err error) {
 	via := "-"
 	if u, perr := url.Parse(upstream); perr == nil && u.Host != "" {
 		via = u.Host
 	}
-	log.Printf("%s %s via %s: %v", r.Method, r.Host, via, err)
+	log.Printf("%s %s via %s: %v", method, target, via, err)
 }

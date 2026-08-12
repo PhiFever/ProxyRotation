@@ -1,5 +1,6 @@
 # 复制为 config.yaml 后修改。config.yaml 含凭据，已被 .gitignore 排除。
-listen: ":1080"            # 入站 HTTP 代理监听地址
+listen: ":1080"            # 入站监听地址。HTTP 与 SOCKS5 共用此端口，按首字节自动识别；
+                           #   SOCKS5 客户端请配 socks5h:// 让代理解析域名，见 README 注意事项
 admin_listen: "127.0.0.1:8080"   # 管理接口监听地址。无鉴权，默认只开回环；
                            #   要从别处访问请走 SSH 隧道，不要直接改成 ":8080"
 
@@ -49,5 +50,6 @@ max_dead_ips: 10
 test_url: "http://connectivitycheck.platform.hicloud.com/generate_204"
 
 auth:                      # 入站代理鉴权（可选，留空则不鉴权）
+                           #   HTTP 侧走 Basic，SOCKS5 侧走 RFC 1929，同一组账号
   username: ""
   password: ""

@@ -32,6 +32,10 @@ type Rotator struct {
 	mu         sync.RWMutex
 	current    string
 	lastSwitch time.Time
+	// lastForced 只记 /switch 的时间，不跟 lastSwitch 混用：后者被首次获取、到期轮换、
+	// 失败自愈一起更新，拿它当 /switch 的窗口会把"刚拿到一个 IP 就发现它被目标站点
+	// 标记了"这类合法的立即切换一并挡掉——而那正是 /switch 最该管用的时刻。
+	lastForced time.Time
 	forceNext  bool
 	cooldown   time.Duration
 
@@ -103,11 +107,30 @@ func (r *Rotator) Get() (string, error) {
 	return r.rotateLocked()
 }
 
-// Switch 由管理接口 POST /switch 调用，立即强制轮换。
-func (r *Rotator) Switch() (string, error) {
+// Switch 由管理接口 POST /switch 调用，立即强制轮换。返回的 bool 表示这一次是否
+// 真的换了——窗口内的重复调用、以及 provider.Next() 失败后保留旧代理的降级，都是 false。
+//
+// ★冷却窗口内的重复调用不再买新 IP，直接把刚换好的那个返回给调用方。
+// /switch 的真实用法是"目标站点把这个 IP 标记了，给我换一个"，而并发采集里 N 个
+// worker 会同时撞上同一个被标记的 IP、各打一次 /switch。不节流的话有两重代价：
+// 一是买 N 个 IP 只用得上 1 个；二是这些 switch 之间没有成功转发穿插，proven 一直
+// 是 false，deadIPs 会一路累加到 onExhausted 停机（max_dead_ips=3 时第 4 次 switch
+// 就触顶）——本该防烧钱的闸门反而被正常用法踩响。
+//
+// 窗口复用 cooldown，与 MarkFailed 里那段防抖是同一个语义：刚换过就别再换。
+func (r *Rotator) Switch() (string, bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.rotateLocked()
+
+	if time.Since(r.lastForced) < r.cooldown {
+		return r.current, false, nil
+	}
+	// 取不到新 IP 时也记时间，让 provider 挂掉期间的重复 /switch 自动退避成每窗口一次。
+	r.lastForced = time.Now()
+
+	before := r.current
+	proxy, err := r.rotateLocked()
+	return proxy, proxy != before, err
 }
 
 func (r *Rotator) Current() string {

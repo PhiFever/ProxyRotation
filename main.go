@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -47,18 +48,24 @@ func main() {
 	stats := NewStats(cfg.UnitPrice)
 	rotator := NewRotator(cfg, provider, stats)
 
-	proxySrv := &http.Server{
-		Addr:    cfg.Listen,
-		Handler: NewProxyServer(cfg, rotator, stats),
+	// 数据面这条监听要自己建：它得先经过 sniffListener 分流 HTTP 与 SOCKS5，
+	// 交给 http.Server 的只是判别完的 HTTP 连接。
+	proxyLn, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		log.Fatalf("listen %s: %v", cfg.Listen, err)
 	}
+	proxyHandler := NewProxyServer(cfg, rotator, stats)
+	proxySrv := &http.Server{Handler: proxyHandler}
 	adminSrv := &http.Server{
 		Addr:    cfg.AdminListen,
 		Handler: NewAdminHandler(rotator, stats),
 	}
 
-	go serve(proxySrv, "proxy")
-	go serve(adminSrv, "admin")
-	log.Printf("ProxyRotation %s: proxy on %s, admin on %s", Version, cfg.Listen, cfg.AdminListen)
+	go serve(func() error {
+		return proxySrv.Serve(newSniffListener(proxyLn, proxyHandler.HandleSOCKS5))
+	}, "proxy")
+	go serve(adminSrv.ListenAndServe, "admin")
+	log.Printf("ProxyRotation %s: proxy (http+socks5) on %s, admin on %s", Version, cfg.Listen, cfg.AdminListen)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -71,8 +78,8 @@ func main() {
 	log.Println("shutdown complete")
 }
 
-func serve(srv *http.Server, name string) {
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+func serve(run func() error, name string) {
+	if err := run(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("%s server: %v", name, err)
 	}
 }
