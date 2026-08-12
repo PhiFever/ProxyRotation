@@ -1,6 +1,3 @@
-# 临时设计文档，不入库
-DESIGN.md
-
 # 含凭据或本机私有设置，不入库（提交 config.example.yaml 作为模板）
 config.yaml
 config.*.yaml
@@ -14,3 +11,4 @@ config.*.yaml
 *.test
 
 *.log
+/docs
