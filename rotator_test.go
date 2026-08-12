@@ -196,6 +196,67 @@ func TestGetNotBlockedDuringProbe(t *testing.T) {
 	close(release)
 }
 
+// 连续买到的上游一个都没跑通 → 停机。无人值守时这是唯一的消费闸：继续降级下去，
+// 按个收费的来源会一个接一个买新 IP，而下游采集任务只会收到一堆空数据还以为一切正常。
+func TestRotatorStopsAfterConsecutiveDeadIPs(t *testing.T) {
+	r := newTestRotator("api", "cycle", time.Minute)
+	r.maxDeadIPs = 3
+	var got int
+	r.onExhausted = func(deadIPs int) { got = deadIPs }
+
+	// 每次都是"拿到新 IP → 失败 → 探测判死"，一个都没成功转发过
+	for range r.maxDeadIPs {
+		mustGet(t, r)
+		r.MarkFailed()
+	}
+	if got != 0 {
+		t.Fatalf("还没触顶就停机了（deadIPs=%d）", got)
+	}
+
+	mustGet(t, r) // 第 3 个死 IP 在这里被结账，触顶
+	if got != r.maxDeadIPs {
+		t.Fatalf("触顶没有停机：onExhausted 收到 %d, want %d", got, r.maxDeadIPs)
+	}
+}
+
+// 中间只要成功转发过一次，计数就清零：真正危险的是"连续"全死，
+// 偶发失败混着成功说明链路还活着，不该把服务停掉。
+func TestSuccessClearsDeadIPs(t *testing.T) {
+	r := newTestRotator("api", "cycle", time.Minute)
+	r.maxDeadIPs = 2
+	r.onExhausted = func(int) { t.Error("中间成功过，不该停机") }
+
+	for range r.maxDeadIPs * 3 {
+		mustGet(t, r)
+		r.OnSuccess()
+		r.MarkFailed()
+	}
+}
+
+// 取不到新 IP 时保留旧代理是有意的降级，但它必须有上界——否则程序会拿着一个
+// 死代理无限期地假装在工作，这正是数据采集任务最怕的失败方式。
+func TestDeadIPsCountsFailedProviderToo(t *testing.T) {
+	r := newTestRotator("api", "cycle", time.Minute)
+	r.maxDeadIPs = 2
+	stopped := false
+	r.onExhausted = func(int) { stopped = true }
+
+	mustGet(t, r) // 先拿到一个上游，之后 provider 再也取不出新的
+	r.provider = &brokenProvider{}
+
+	for i := 0; i < r.maxDeadIPs && !stopped; i++ {
+		r.MarkFailed()
+		mustGet(t, r) // 降级：仍返回旧代理
+	}
+	if !stopped {
+		t.Fatal("provider 一直失败却没有停机")
+	}
+}
+
+type brokenProvider struct{}
+
+func (brokenProvider) Next() (string, error) { return "", fmt.Errorf("取不到 IP") }
+
 // probeCacheTTL > probeTimeout 是硬约束：反过来的话缓存刚写入就过期，
 // 失败场景下等于没有缓存。上限也有约束，分钟级缓存会拒绝该做的切换。
 func TestProbeCacheTTLInvariant(t *testing.T) {

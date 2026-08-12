@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"sync"
 	"time"
 )
@@ -37,6 +38,17 @@ type Rotator struct {
 	failThreshold    int
 	consecutiveFails int
 
+	// proven 记录当前代理有没有至少成功转发过一次。轮换时它还是 false，说明这个
+	// 上游从拿到手到被换掉一次都没通过——按个收费的来源下，那就是白买了一个。
+	// deadIPs 数的正是连续白买了几个，任何一次成功即清零。
+	proven     bool
+	deadIPs    int
+	maxDeadIPs int
+
+	// onExhausted 在 deadIPs 触到上限时调用，默认实现打一行日志并退出进程。
+	// 在写锁内调用，实现里不要再回调 Rotator。
+	onExhausted func(deadIPs int)
+
 	lastProbe   time.Time
 	lastProbeOK bool
 
@@ -56,6 +68,16 @@ func NewRotator(cfg *Config, p Provider, s *Stats) *Rotator {
 		testURL:       cfg.TestURL,
 		cooldown:      defaultCooldown,
 		failThreshold: defaultFailThreshold,
+		maxDeadIPs:    cfg.MaxDeadIPs,
+		// 停机而不是继续降级：数据采集这类无人值守的消费者需要的是"任务失败"这个信号。
+		// 拿着一个死代理继续跑，下游会收到一堆空数据却以为采集正常，而按个收费的来源
+		// 还会一个接一个地买新 IP。
+		//
+		// 不用 panic：net/http 对 handler goroutine 的 panic 有 recover，只会断掉一条
+		// 连接、进程照跑，而 Get / MarkFailed 全是从 handler goroutine 调过来的。
+		onExhausted: func(deadIPs int) {
+			log.Fatalf("连续 %d 个上游一次都没跑通，停机。请检查 via / 代理账号 / test_url 可达性", deadIPs)
+		},
 		probe: func(proxyURL, testURL string) bool {
 			return probeProxy(cfg.Via, proxyURL, testURL)
 		},
@@ -99,6 +121,8 @@ func (r *Rotator) OnSuccess() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.consecutiveFails = 0
+	r.proven = true
+	r.deadIPs = 0
 }
 
 // MarkFailed 在上游失败时调用。是否切换取决于来源的成本模型：
@@ -152,8 +176,18 @@ func (r *Rotator) MarkFailed() {
 }
 
 // rotateLocked 必须在写锁内调用。
-// provider.Next() 失败时保留旧 current，降级但不中断。
+// provider.Next() 失败时保留旧 current：单次抖动不该中断服务。但这种降级有上界，
+// 由下面的 deadIPs 兜住——取不到新 IP 时 proven 同样留在 false，于是反复尝试恢复
+// 而始终不成功的情况最终也会停机，不会永远拿着一个死代理装作还在工作。
 func (r *Rotator) rotateLocked() (string, error) {
+	// 先结上一个上游的账，再买下一个：已经触顶就不该再掏钱。
+	if r.current != "" && !r.proven {
+		r.deadIPs++
+		if r.maxDeadIPs > 0 && r.deadIPs >= r.maxDeadIPs {
+			r.onExhausted(r.deadIPs)
+		}
+	}
+
 	next, err := r.provider.Next()
 	if err != nil {
 		if r.current != "" {
@@ -164,6 +198,7 @@ func (r *Rotator) rotateLocked() (string, error) {
 	r.current = next
 	r.lastSwitch = time.Now()
 	r.consecutiveFails = 0
+	r.proven = false
 	r.stats.OnSwitch(next)
 	return next, nil
 }

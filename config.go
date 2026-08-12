@@ -18,6 +18,9 @@ const (
 	// 于是健康代理也被判死，失败自愈退化成"每次失败都换 IP"，省钱机制静默失效。
 	// 最佳做法是填代理商自己的测试端点，见 config.example.yaml。
 	defaultTestURL = "http://connectivitycheck.platform.hicloud.com/generate_204"
+	// 连续这么多个上游都没成功转发过一次就停机。取值要能穿过一次短暂抖动，
+	// 又不至于在真出事时买下一长串死 IP。
+	defaultMaxDeadIPs = 10
 )
 
 type Config struct {
@@ -41,6 +44,10 @@ type Config struct {
 
 	UnitPrice float64 `yaml:"unit_price"`
 	TestURL   string  `yaml:"test_url"`
+
+	// MaxDeadIPs 是"连续多少个上游一次都没跑通就停机"的上限。留空取默认值，
+	// 负数表示不限。见 Rotator.onExhausted：这是无人值守时唯一的消费闸。
+	MaxDeadIPs int `yaml:"max_dead_ips"`
 
 	Auth struct {
 		Username string `yaml:"username"`
@@ -79,6 +86,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.TestURL == "" {
 		c.TestURL = defaultTestURL
+	}
+	if c.MaxDeadIPs == 0 {
+		c.MaxDeadIPs = defaultMaxDeadIPs
 	}
 }
 
