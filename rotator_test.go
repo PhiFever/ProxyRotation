@@ -118,6 +118,30 @@ func TestMarkFailedAPIKeepsProxyWhenProbeAlive(t *testing.T) {
 	}
 }
 
+// 探测只回答"代理还连得上 test_url 吗"，回答不了"它还能不能用来连目标"。目标把出口 IP
+// 标记掉时探测照样通过，少了这条兜底，同一个上游会一直失败到它自己过期为止。
+func TestMarkFailedAPISwitchesWhenProbeKeepsPassing(t *testing.T) {
+	r := newTestRotator("api", "cycle", time.Minute)
+	probed := false
+	r.probe = func(string, string) bool { probed = true; return true }
+
+	p1 := mustGet(t, r)
+	for range defaultFailThreshold - 1 {
+		r.MarkFailed()
+	}
+	if got := mustGet(t, r); got != p1 {
+		t.Fatalf("没到阈值就换了，探测还说它活着：%s -> %s", p1, got)
+	}
+	if !probed {
+		t.Fatal("阈值之前一次都没探测：省钱机制被绕过了")
+	}
+
+	r.MarkFailed()
+	if got := mustGet(t, r); got == p1 {
+		t.Fatalf("探测一直通过就永远不换，同一个上游会一直失败下去：仍是 %s", got)
+	}
+}
+
 // api 来源探不通 → 代理真死了，下一个请求换。
 func TestMarkFailedAPISwitchesWhenProbeDead(t *testing.T) {
 	r := newTestRotator("api", "cycle", time.Minute)

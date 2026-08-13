@@ -171,6 +171,19 @@ func (r *Rotator) MarkFailed() {
 
 	// api / command：先确认当前代理是不是真的死了。
 	// 探通 → 是目标/网络抖动的锅，保留当前代理，省下一个付费 IP。
+	//
+	// 但探测答的是"这个代理还连得上 test_url 吗"，答不了"它还能不能用来连目标"。
+	// 目标把出口 IP 标记掉时（回验证页、或干脆拒连）探测照样通过，自愈就再也触发不了，
+	// 同一个上游会一直失败到它自己过期为止。所以连续失败到阈值就无条件换，不再问探测；
+	// 这条兜底的成本上界仍由 deadIPs 兜着。
+	r.consecutiveFails++
+	if r.consecutiveFails >= r.failThreshold {
+		r.forceNext = true
+		r.consecutiveFails = 0
+		r.mu.Unlock()
+		return
+	}
+
 	if time.Since(r.lastProbe) < probeCacheTTL {
 		if !r.lastProbeOK {
 			r.forceNext = true
